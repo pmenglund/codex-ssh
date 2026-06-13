@@ -105,6 +105,74 @@ You can also SSH into the container and run `codex` to complete an interactive
 login. Keeping `/home/codex` on a named volume preserves Codex configuration
 across container updates.
 
+### Device code login
+
+For remote or headless containers, use Codex device code authentication instead
+of the browser callback flow:
+
+```sh
+ssh -p 2222 codex@localhost
+codex login --device-auth
+```
+
+Codex prints a browser URL and a one-time code. Open the URL on a machine with a
+browser, sign in, and enter the code. The login cache is stored under the
+persistent `/home/codex` volume, so it survives container updates.
+
+Device code authentication must be enabled for your ChatGPT account or
+workspace. If the server does not allow device code login, Codex falls back to
+the standard browser-based login flow.
+
+## Git credentials
+
+Use a dedicated SSH key for Git access from the remote container. Do not mount
+your personal `~/.ssh` directory wholesale into the container.
+
+Create a key inside the container:
+
+```sh
+ssh -p 2222 codex@localhost
+
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+
+ssh-keygen -t ed25519 -C "codex-ssh@remote" -f ~/.ssh/id_ed25519_github
+
+cat ~/.ssh/id_ed25519_github.pub
+```
+
+Add the printed public key to GitHub:
+
+- For broad account access: GitHub → Settings → SSH and GPG keys → New SSH key
+- For a single repository: repository → Settings → Deploy keys → Add deploy key
+
+Only enable write access for a deploy key if this container needs to push.
+
+Configure SSH in the container:
+
+```sh
+cat > ~/.ssh/config <<'EOF'
+Host github.com
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/id_ed25519_github
+  IdentitiesOnly yes
+EOF
+
+ssh-keyscan github.com >> ~/.ssh/known_hosts
+chmod 600 ~/.ssh/config ~/.ssh/id_ed25519_github ~/.ssh/known_hosts
+```
+
+Test GitHub SSH access:
+
+```sh
+ssh -T git@github.com
+git clone git@github.com:pmenglund/codex-ssh.git /workspace/codex-ssh
+```
+
+The key and SSH config live under `/home/codex`, so they persist across image
+updates when `/home/codex` is mounted as a volume.
+
 ## Upgrade flow
 
 Pull a newer image and replace the container while reusing the same volumes:
