@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM golang:1.26.8-bookworm
+FROM golang:1.27.1-bookworm
 
 ARG TARGETARCH
 ARG CODEX_VERSION=0.153.4
