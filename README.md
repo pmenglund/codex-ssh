@@ -8,14 +8,16 @@ image or published to Docker Hub.
 
 ## Contents
 
-- Base image: `golang:1.26.4-bookworm`
-- Codex CLI: `0.139.0`, downloaded directly from GitHub release assets
+- Base image: `golang:1.26.8-bookworm`
+- Codex CLI: `0.153.4`, installed with its companion executables and sandbox resources
+  from the official Linux package; SHA-256 checked before extraction
 - Tools: Go, Git, OpenSSH server/client, curl, CA certificates, and basic shell utilities
 - SSH user: `codex`
 - Exposed port: `22`
 - Persistent volumes:
   - `/home/codex` for Codex config, SSH state, shell history, caches, and user tooling
   - `/workspace` for repositories and active work
+  - `/var/lib/sshd` for the private SSH server identity (root-owned)
 
 ## Build locally
 
@@ -43,14 +45,15 @@ Create persistent volumes and start the container:
 ```sh
 docker volume create codex-home
 docker volume create codex-workspace
+docker volume create codex-host-keys
 
 docker run -d \
   --name codex-ssh \
   -p 2222:22 \
   -e AUTHORIZED_KEYS="$(cat ~/.ssh/id_ed25519.pub)" \
-  -e OPENAI_API_KEY="$OPENAI_API_KEY" \
   -v codex-home:/home/codex \
   -v codex-workspace:/workspace \
+  -v codex-host-keys:/var/lib/sshd \
   pmenglund/codex-ssh:latest
 ```
 
@@ -87,19 +90,64 @@ If `/home/codex` is a persistent volume and already contains
 new keys are provided through `AUTHORIZED_KEYS`, `AUTHORIZED_KEYS_FILE`, or
 `/run/secrets/authorized_keys`.
 
+An explicitly set `AUTHORIZED_KEYS_FILE` must be a readable regular file,
+even when `AUTHORIZED_KEYS` is also provided. Empty or invalid supplied keys
+stop startup. Valid replacements are written atomically; a failed replacement
+leaves the previous file intact, but the container does not start.
+
 Password login and root login are disabled.
+
+### SSH server identity
+
+The container generates an Ed25519 host key on first startup and stores it in
+`/var/lib/sshd`. Give each deployment its own `codex-host-keys` volume and reuse
+that volume when replacing its container. Do not share it between running
+containers. The image contains no private host keys. Startup reconstructs the public-key
+file from the private key so fingerprint checks report the served identity.
+
+### Volume permissions
+
+The user is fixed as `codex` (UID/GID 1000), with `HOME=/home/codex`. Codex
+uses `/home/codex/.codex` in SSH sessions and `docker exec --user codex`.
+SSH sets `CODEX_HOME` explicitly; `docker exec --user codex` uses Codex's default
+under that user's home. Root uses `/root` and a system-only command search path.
+Do not set `HOME` or `CODEX_HOME` globally on the container.
+
+SSH sessions include the user's Go tooling directories in `PATH`. To run tools
+installed there with Docker, use their full path and `--user codex`.
+
+New named volumes inherit the image's ownership. Bind-mounted home and workspace
+directories must already be writable by UID/GID 1000. Startup does not change
+their ownership or traverse repositories and caches to repair permissions.
+The `/var/lib/sshd` mount must be root-owned; startup restricts it to mode 0700
+and its private host key to mode 0600.
 
 ## Codex credentials
 
-Do not put Codex credentials in the image. Use one of these runtime options:
+Do not put Codex credentials in the image. To initialize API-key authentication
+at startup, add this option to `docker run` after setting a nonempty key:
 
 ```sh
 -e OPENAI_API_KEY="$OPENAI_API_KEY"
 ```
 
+The entrypoint pipes the key into `codex login --with-api-key` as the `codex`
+user. It stores credentials in `/home/codex/.codex/auth.json` and removes the
+key from the environment before starting SSH. Supplying a key replaces stored
+authentication on each startup. An explicitly empty or whitespace-only key
+stops startup; omitting the variable preserves the existing login.
+Use Codex's default file credential store with this option. Docker administrators
+can still inspect values supplied with `docker run -e`.
+
+Alternatively, mount a dedicated Codex configuration directory already owned
+by UID/GID 1000:
+
 ```sh
--v "$HOME/.codex:/home/codex/.codex"
+-v /path/to/codex-config:/home/codex/.codex
 ```
+
+It must contain file-based credentials; credentials held only in your host's
+OS keychain are not included in a directory mount. Treat `auth.json` as a secret.
 
 You can also SSH into the container and run `codex` to complete an interactive
 login. Keeping `/home/codex` on a named volume preserves Codex configuration
@@ -120,8 +168,9 @@ browser, sign in, and enter the code. The login cache is stored under the
 persistent `/home/codex` volume, so it survives container updates.
 
 Device code authentication must be enabled for your ChatGPT account or
-workspace. If the server does not allow device code login, Codex falls back to
-the standard browser-based login flow.
+workspace. If it is unavailable, authenticate locally and copy the file-based
+login cache, or forward the browser callback over SSH. See the
+[official authentication instructions](https://learn.chatgpt.com/docs/auth).
 
 ## Git credentials
 
@@ -159,7 +208,17 @@ Host github.com
   IdentitiesOnly yes
 EOF
 
-ssh-keyscan github.com >> ~/.ssh/known_hosts
+ssh-keyscan github.com > /tmp/github-host-keys
+ssh-keygen -lf /tmp/github-host-keys
+```
+
+Compare the fingerprints with
+[GitHub's published SSH fingerprints](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)
+before trusting the keys. Then install the verified keys:
+
+```sh
+cat /tmp/github-host-keys >> ~/.ssh/known_hosts
+rm /tmp/github-host-keys
 chmod 600 ~/.ssh/config ~/.ssh/id_ed25519_github ~/.ssh/known_hosts
 ```
 
@@ -175,7 +234,29 @@ updates when `/home/codex` is mounted as a volume.
 
 ## Upgrade flow
 
-Pull a newer image and replace the container while reusing the same volumes:
+Reuse all three named volumes when replacing the container. If upgrading from
+an image that only used home and workspace volumes, create the host-key volume
+first:
+
+```sh
+docker volume create codex-host-keys
+```
+
+That first upgrade changes the server fingerprint because older images contained
+a shared private host key. Do not copy that key into the new volume. After
+starting the replacement, read its new fingerprint through your trusted Docker
+connection:
+
+```sh
+docker exec codex-ssh ssh-keygen -lf /var/lib/sshd/ssh_host_ed25519_key.pub
+```
+
+Compare this with the fingerprint shown by SSH before updating the matching
+`known_hosts` entry. Subsequent replacements keep the identity when the same
+host-key volume is mounted. Rolling back to an older image can change the
+fingerprint again because it does not use this volume.
+
+Pull and replace:
 
 ```sh
 docker pull pmenglund/codex-ssh:latest
@@ -186,11 +267,19 @@ docker run -d \
   -p 2222:22 \
   -v codex-home:/home/codex \
   -v codex-workspace:/workspace \
+  -v codex-host-keys:/var/lib/sshd \
   pmenglund/codex-ssh:latest
 ```
 
-If the authorized keys are already present in `codex-home`, they do not need to
-be passed again.
+If authorized keys and Codex credentials are already present in `codex-home`,
+they do not need to be passed again. Reapply any additional runtime options or
+bind mounts from your deployment.
+
+Credentials previously initialized through `docker exec` with the old
+`CODEX_HOME=/home/codex` may be stored directly in `/home/codex/auth.json`.
+Inspect that file separately and, if it contains the login you want, migrate it
+to `/home/codex/.codex/auth.json` as `codex` with mode 0600. Do not overwrite an
+existing login without checking which account it belongs to.
 
 ## Docker Hub publishing
 
@@ -221,3 +310,23 @@ Run the container on the remote host and add an SSH connection using:
 
 Use `/workspace` as the default working directory for repositories and remote
 operations.
+
+## Dependency updates
+
+Dependabot opens weekly pull requests for the Go base image and GitHub Actions.
+Each pull request runs the two-architecture smoke tests before publishing is
+allowed after merge.
+
+Codex updates require changing `CODEX_VERSION`, `CODEX_SHA256_AMD64`, and
+`CODEX_SHA256_ARM64` together in `Dockerfile`, plus the version above. Use the
+`digest` values for `codex-package-x86_64-unknown-linux-musl.tar.gz` and
+`codex-package-aarch64-unknown-linux-musl.tar.gz` from the corresponding
+[official GitHub release API](https://api.github.com/repos/openai/codex/releases/latest).
+Keep the SHA-256 hex value without the `sha256:` prefix. A version override
+without matching digests fails the build. Build and test both architectures
+before publishing.
+
+The smoke test supports Bash 3.2 and newer. It checks SSH access restrictions,
+server identity persistence and uniqueness, invalid key configuration, API-key
+login with a dummy credential, and ownership preservation. It makes no model
+requests and does not need a real API key.
